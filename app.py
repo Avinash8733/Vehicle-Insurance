@@ -1,11 +1,18 @@
 import streamlit as st
 import pandas as pd
 import joblib
+import os
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import GradientBoostingClassifier
 
 # Set page config
 st.set_page_config(page_title="Vehicle Insurance Fraud Detection", layout="wide")
 
-# Embedded Schema to avoid dependency on the CSV file
+# Embedded Schema
 DATA_SCHEMA = {
     "Month": ["Apr", "Aug", "Dec", "Feb", "Jan", "Jul", "Jun", "Mar", "May", "Nov", "Oct", "Sep"],
     "WeekOfMonth": [1, 2, 3, 4, 5],
@@ -40,9 +47,72 @@ DATA_SCHEMA = {
     "BasePolicy": ["All Perils", "Collision", "Liability"]
 }
 
+def train_model():
+    """Retrains the model if pickle is missing or incompatible."""
+    try:
+        if not os.path.exists('fraud_oracle.csv'):
+            st.error("Dataset 'fraud_oracle.csv' not found. Cannot retrain model.")
+            return None
+        
+        df = pd.read_csv('fraud_oracle.csv')
+        # Cleaning
+        df = df[df['DayOfWeekClaimed'] != '0']
+        df = df[df['MonthClaimed'] != '0']
+        if 'PolicyNumber' in df.columns:
+            df = df.drop('PolicyNumber', axis=1)
+        
+        target_col = 'FraudFound_P'
+        X = df.drop(target_col, axis=1)
+        y = df[target_col]
+        
+        # Features
+        categorical_cols = X.select_dtypes(include=['object']).columns.tolist()
+        numerical_cols = X.select_dtypes(include=['int64', 'float64']).columns.tolist()
+        
+        # Pipeline
+        numeric_transformer = Pipeline(steps=[
+            ('imputer', SimpleImputer(strategy='median')),
+            ('scaler', StandardScaler())
+        ])
+        categorical_transformer = Pipeline(steps=[
+            ('imputer', SimpleImputer(strategy='most_frequent')),
+            ('onehot', OneHotEncoder(handle_unknown='ignore'))
+        ])
+        preprocessor = ColumnTransformer(
+            transformers=[
+                ('num', numeric_transformer, numerical_cols),
+                ('cat', categorical_transformer, categorical_cols)
+            ])
+        
+        model = GradientBoostingClassifier(n_estimators=100, random_state=42)
+        pipeline = Pipeline(steps=[('preprocessor', preprocessor), ('classifier', model)])
+        
+        # Train
+        pipeline.fit(X, y)
+        
+        # Save
+        joblib.dump(pipeline, 'pipeline.pkl')
+        return pipeline
+        
+    except Exception as e:
+        st.error(f"Training failed: {e}")
+        return None
+
 @st.cache_resource
 def load_pipeline():
-    return joblib.load('pipeline.pkl')
+    # Try loading existing pipeline
+    pipeline = None
+    if os.path.exists('pipeline.pkl'):
+        try:
+            pipeline = joblib.load('pipeline.pkl')
+        except Exception:
+            pipeline = None # Force retrain if load fails
+            
+    # If no pipeline or load failed, retrain
+    if pipeline is None:
+        pipeline = train_model()
+        
+    return pipeline
 
 def main():
     st.title("🚗 Vehicle Insurance Claim Fraud Detection")
@@ -52,10 +122,11 @@ def main():
     """)
 
     # Load Pipeline
-    try:
+    with st.spinner("Loading/Training Model..."):
         pipeline = load_pipeline()
-    except Exception as e:
-        st.error(f"Error loading pipeline: {e}")
+    
+    if pipeline is None:
+        st.error("Failed to load or train model.")
         return
 
     # Sidebar for inputs
@@ -66,20 +137,9 @@ def main():
     # Iterate over schema to create inputs
     for col, values in DATA_SCHEMA.items():
         if isinstance(values, list):
-            # Sort options for better UX where appropriate, but respect schema order if meaningful? 
-            # Alphabetical is usually safe.
-            # But converting numbers to strings for display might be needed ifmixed.
-            # Here values are already mostly consistent.
-            
-            # Sort if all strings, or all numbers
-            try:
-                options = sorted(values)
-            except:
-                options = values
-                
+            options = values
             input_data[col] = st.sidebar.selectbox(f"{col}", options)
         elif isinstance(values, dict) and values.get('type') == 'number':
-            # Numeric Input
             val = float(values['median'])
             min_v = float(values['min'])
             max_v = float(values['max'])
@@ -88,19 +148,11 @@ def main():
     # Create DataFrame for prediction
     input_df = pd.DataFrame([input_data])
     
-    # Ensure columns are in the same/correct order? 
-    # The pipeline column transformer usually handles column reordering by name if named, 
-    # but strictly speaking, we passed columns by name in `analysis_and_training.py`.
-    # `pd.DataFrame([input_data])` will have keys in insertion order (Py3.7+) which matches schema definition order.
-    # To be safe, reindex?
-    # The schema keys are the exact feature names.
-    
     st.subheader("Prediction Result")
     
     if st.button("Predict Fraud Status"):
         try:
             # Predict
-            # Pipeline expects specific columns.
             prediction = pipeline.predict(input_df)[0]
             probability = pipeline.predict_proba(input_df)[0][1]
             
@@ -115,8 +167,25 @@ def main():
                 st.info("This claim appears to be legitimate.")
 
         except Exception as e:
-            st.error(f"An error occurred during prediction: {e}")
-            st.write("Please check inputs.")
+            # If prediction fails (e.g. version mismatch even after load), force retrain
+            st.warning(f"Error during prediction ({e}). Attempting to retrain model...")
+            try:
+                os.remove('pipeline.pkl') # Force delete
+                st.cache_resource.clear()
+                pipeline = train_model()
+                if pipeline:
+                    prediction = pipeline.predict(input_df)[0]
+                    probability = pipeline.predict_proba(input_df)[0][1]
+                    if prediction == 1:
+                        st.error("🚨 FRAUD DETECTED")
+                        st.markdown(f"**Probability of Fraud:** {probability:.2%}")
+                    else:
+                        st.success("✅ CLAIM APPROVED")
+                        st.markdown(f"**Probability of Fraud:** {probability:.2%}")
+                else:
+                    st.error("Retraining failed.")
+            except Exception as e2:
+                st.error(f"Critical error: {e2}")
 
 if __name__ == "__main__":
     main()
